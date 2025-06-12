@@ -38,10 +38,10 @@
       // undistort->d1 = 0.00155893534296691;
 
 /**
- *  gst-launch-1.0 --gst-plugin-path=/home/amither/Downloads/calibartion filesrc location=/home/amither/Downloads/2025-05-07_17-28-45.mp4 ! 
- * decodebin ! videoconvert ! video/x-raw,format=GRAY8 !
- *  undistort fx=277.7090664510777 cx=290.6865358454301 fy=277.5687125242331 cy=240.1597738541476 d0=-0.006319990900085937 d1=0.00155893534296691 algo=1
- *  ! videoconvert ! autovideosink
+  gst-launch-1.0 --gst-plugin-path=/home/amither/Downloads/calibartion/build/ filesrc location=/home/amither/Downloads/calibartion/2025-05-06_14-21-32.mp4 ! \
+  decodebin ! videoconvert ! video/x-raw,format=GRAY8 ! \
+  undistort fx=277.7090664510777 cx=290.6865358454301 fy=277.5687125242331 cy=240.1597738541476 d0=-0.006319990900085937 d1=0.00155893534296691 algo=1 balance=1.0 fov=1.0 \
+  ! videoconvert ! autovideosink
  */
 
 
@@ -60,6 +60,9 @@
 #include "gstundistort.h"
 #include <algorithm> // for std::min/max
 #include <cmath>
+#include <array>
+#include <limits>
+#include <cstdint>  // or use <stdint.h>
 
 GST_DEBUG_CATEGORY_STATIC (gst_undistort_debug_category);
 #define GST_CAT_DEFAULT gst_undistort_debug_category
@@ -96,8 +99,11 @@ enum
   PROP_CY,
   PROP_D0,
   PROP_D1,
+  PROP_P1,
+  PROP_P2,
   PROP_ALGO,
-
+  PROP_FOV,
+  PROP_BALANCE,
 };
 
 
@@ -142,11 +148,24 @@ gst_undistort_class_init (GstUndistortClass * klass)
   gobject_class->get_property = gst_undistort_get_property;
   gobject_class->dispose = gst_undistort_dispose;
   gobject_class->finalize = gst_undistort_finalize;
+
   base_transform_class->start = GST_DEBUG_FUNCPTR (gst_undistort_start);
   base_transform_class->stop = GST_DEBUG_FUNCPTR (gst_undistort_stop);
   video_filter_class->set_info = GST_DEBUG_FUNCPTR (gst_undistort_set_info);
   video_filter_class->transform_frame = GST_DEBUG_FUNCPTR (gst_undistort_transform_frame);
   video_filter_class->transform_frame_ip = GST_DEBUG_FUNCPTR (gst_undistort_transform_frame_ip);
+
+  g_object_class_install_property (gobject_class, PROP_FOV,
+  g_param_spec_float ("fov", "Field of view",
+  "Field of view can simulate zooming (e.g., 0.8 for zoom-in)",
+  0.0, 100000.0, 0.0,
+  (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+  g_object_class_install_property (gobject_class, PROP_BALANCE,
+  g_param_spec_float ("balance", "Balance fot init",
+  "(0)  principal point moves to image center balance\n(1) keeps original principal point",
+  0.0, 100000.0, 0.0,
+  (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
   g_object_class_install_property (gobject_class, PROP_START_ROW_CROP,
   g_param_spec_uint ("crop-sr", "Crop Start Row",
@@ -208,12 +227,26 @@ gst_undistort_class_init (GstUndistortClass * klass)
   -1.0, 1.0, 0.0,
   (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
+  g_object_class_install_property (gobject_class, PROP_P1,
+  g_param_spec_float ("p1", "k1",
+  "First radial distortion coefficient",
+  -1.0, 1.0, 0.0,
+  (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
+  g_object_class_install_property (gobject_class, PROP_P2,
+  g_param_spec_float ("p2", "k2",
+  "Second radial distortion coefficient",
+  -1.0, 1.0, 0.0,
+  (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+
   g_object_class_install_property (gobject_class, PROP_ALGO,
   g_param_spec_uint("algo", "Interpolation",
   "The Interpolation:\n"
   "0 - K nearest\n"
-  "1 - Bilinear",
-  0, 1, 0,
+  "1 - Bilinear"
+  "2 - Bicubic "
+  "3 - Opencv",
+  0, 3, 0,
   (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
 
 }
@@ -221,7 +254,7 @@ gst_undistort_class_init (GstUndistortClass * klass)
 static void
 gst_undistort_init (GstUndistort *undistort)
 {
-  undistort->R = {1,0,0, 0,1,0, 0,0,1}; // Identity rotation
+  undistort->R = {1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0}; // Identity rotation
 }
 
 void
@@ -277,7 +310,23 @@ gst_undistort_set_property (GObject * object, guint property_id,
     case PROP_D1:
       undistort->d1 = g_value_get_float(value);
       break;
-    
+
+    case PROP_P1:
+      undistort->p1 = g_value_get_float(value);
+      break;
+
+    case PROP_P2:
+      undistort->p2 = g_value_get_float(value);
+      break;
+
+    case PROP_BALANCE:
+      undistort->balance = g_value_get_float(value);
+      break;
+
+    case PROP_FOV:
+      undistort->fov = g_value_get_float(value);
+      break;
+
     case PROP_ALGO:
       valueZ = g_value_get_uint(value);
       undistort->interpolation = (Interpolation)valueZ;
@@ -288,6 +337,14 @@ gst_undistort_set_property (GObject * object, guint property_id,
       if (undistort->interpolation == INTERPOLATION_BILINEAR)
       {
         g_print("Using INTERPOLATION_BILINEAR interpolation\n");
+      }
+      if (undistort->interpolation == INTERPOLATION_BICUBIC)
+      {
+        g_print("Using INTERPOLATION_BICUBIC interpolation\n");
+      }
+      if (undistort->interpolation == INTERPOLATION_OPENCV)
+      {
+        g_print("Using OPENCV_CHOOSE interpolation\n");
       }
       break;
     default:
@@ -344,6 +401,22 @@ gst_undistort_get_property (GObject * object, guint property_id,
     case PROP_D1:
     g_value_set_float(value, undistort->d1);
       break;
+
+    case PROP_P1:
+    g_value_set_float(value, undistort->p1);
+      break;
+
+    case PROP_P2:
+    g_value_set_float(value, undistort->p2);
+      break;
+
+    case PROP_BALANCE:
+    g_value_set_float(value, undistort->balance);
+      break;
+
+    case PROP_FOV:
+    g_value_set_float(value, undistort->fov);
+      break;
     
     case PROP_ALGO:
       g_value_set_uint(value, undistort->interpolation);
@@ -359,6 +432,7 @@ gst_undistort_dispose (GObject * object)
   GstUndistort *undistort = GST_UNDISTORT (object);
 
   GST_DEBUG_OBJECT (undistort, "dispose");
+  std::cout << "Dispose the Undistort" << std::endl;
 
   /* clean up as possible.  may be called multiple times */
 
@@ -373,6 +447,7 @@ gst_undistort_finalize (GObject * object)
   GST_DEBUG_OBJECT (undistort, "finalize");
 
   /* clean up object here */
+  std::cout << "finalize the Undistort" << std::endl;
 
   G_OBJECT_CLASS (gst_undistort_parent_class)->finalize (object);
 }
@@ -383,6 +458,7 @@ gst_undistort_start (GstBaseTransform * trans)
   GstUndistort *undistort = GST_UNDISTORT (trans);
 
   GST_DEBUG_OBJECT (undistort, "start");
+  std::cout << "Start the Undistort" << std::endl;
 
   return TRUE;
 }
@@ -393,20 +469,95 @@ gst_undistort_stop (GstBaseTransform * trans)
   GstUndistort *undistort = GST_UNDISTORT (trans);
 
   GST_DEBUG_OBJECT (undistort, "stop");
+  undistort->initialized = FALSE;
+  std::cout << "Stop the Undistort" << std::endl;
 
   return TRUE;
 }
 
-static gboolean
-gst_undistort_set_info (GstVideoFilter * filter, GstCaps * incaps,
-    GstVideoInfo * in_info, GstCaps * outcaps, GstVideoInfo * out_info)
-{
-  GstUndistort *undistort = GST_UNDISTORT (filter);
 
-  GST_DEBUG_OBJECT (undistort, "set_info");
-
-  return TRUE;
+template <typename T>
+inline T clamp(T val, T lo, T hi) {
+    return std::max(lo, std::min(val, hi));
 }
+
+// void convert_cv_maps_to_uint16(const cv::Mat& map1, std::vector<uint16_t>& map_x, std::vector<uint16_t>& map_y) {
+//     map_x.resize(map1.rows * map1.cols);
+//     map_y.resize(map1.rows * map1.cols);
+
+//     for (int y = 0; y < map1.rows; ++y) {
+//         for (int x = 0; x < map1.cols; ++x) {
+//             const cv::Vec2s& pt = map1.at<cv::Vec2s>(y, x);
+//             map_x[y * map1.cols + x] = static_cast<uint16_t>(pt[0]);
+//             map_y[y * map1.cols + x] = static_cast<uint16_t>(pt[1]);
+//         }
+//     }
+// }
+
+#if defined(USE_CV)
+
+void convert_cv_maps_to_uint16(const cv::Mat& map1, std::vector<uint16_t>& map_x, std::vector<uint16_t>& map_y) {
+    int rows = map1.rows;
+    int cols = map1.cols;
+    map_x.resize(rows * cols);
+    map_y.resize(rows * cols);
+
+    for (int y = 0; y < rows; ++y) {
+        for (int x = 0; x < cols; ++x) {
+            const cv::Vec2s& pt = map1.at<cv::Vec2s>(y, x);
+
+            // Flip coordinates (180° rotate)
+            int flipped_index = (rows - 1 - y) * cols + (cols - 1 - x);
+            map_x[flipped_index] = static_cast<uint16_t>(pt[0]);
+            map_y[flipped_index] = static_cast<uint16_t>(pt[1]);
+        }
+    }
+}
+
+
+void compute_undistort_maps_from_opencv(
+    GstUndistort *undistort,
+    const std::vector<float>& K,
+    const std::vector<float>& D,
+    const std::vector<float>& R,
+    std::vector<float>& Knew,
+    int width,
+    int height,
+    float balance,
+    float fov_scale,
+    std::vector<uint16_t>& map_x,
+    std::vector<uint16_t>& map_y) {
+
+
+    std::cout << "Input parameters:" << std::endl;
+    std::cout << "K: ";
+    for (auto v : K) std::cout << v << " ";
+    std::cout << "\nD: ";
+    for (auto v : D) std::cout << v << " ";
+    std::cout << "\nR: ";
+    for (auto v : R) std::cout << v << " ";
+    std::cout << "\nWidth: " << width << ", Height: " << height << std::endl;
+    std::cout << "Balance: " << balance << ", FOV Scale: " << fov_scale << std::endl;
+
+    cv::Mat K_cv(3, 3, CV_32F, const_cast<float*>(K.data()));
+    cv::Mat D_cv(4, 1, CV_32F, const_cast<float*>(D.data()));
+    cv::Mat R_cv(3, 3, CV_32F, const_cast<float*>(R.data()));
+    cv::Mat Knew_cv;
+    cv::Size imageSize(width, height);
+
+    cv::fisheye::estimateNewCameraMatrixForUndistortRectify(K_cv, D_cv, imageSize, R_cv, Knew_cv, balance, imageSize, fov_scale);
+
+    Knew.assign((float*)Knew_cv.datastart, (float*)Knew_cv.dataend);
+    std::cout << "Knew: ";
+    for (auto v : Knew) std::cout << v << " ";
+    std::cout << std::endl;
+    cv::fisheye::initUndistortRectifyMap(K_cv, D_cv, R_cv, Knew_cv, imageSize, CV_16SC2, undistort->map1CV, undistort->map2CV);
+
+    convert_cv_maps_to_uint16(undistort->map1CV, map_x, map_y);
+}
+
+#endif
+
 void estimateNewCameraMatrix(const std::vector<float>& K, std::vector<float>& Knew, int width, int height, float balance = 0.0f, float fov_scale = 1.0f)
 {
     float fx = K[0];
@@ -424,20 +575,158 @@ void estimateNewCameraMatrix(const std::vector<float>& K, std::vector<float>& Kn
     Knew[0] = fx;  Knew[1] = 0;   Knew[2] = cx_new;
     Knew[3] = 0;   Knew[4] = fy;  Knew[5] = cy_new;
     Knew[6] = 0;   Knew[7] = 0;   Knew[8] = 1;
+
+    std::cout << "Knew:\n" << "(" << Knew[0] << "," << Knew[1] << "," <<  Knew[2] << "," << Knew[3] << "," << Knew[4] << "," << Knew[5] << "," << Knew[6] << "," << Knew[7] << "," << Knew[8] << "," << ")" << std::endl;
 }
 
+void undistortFisheyePoint(const std::array<float, 2>& p,
+                           const std::vector<float>& K,
+                           const std::vector<float>& D,
+                           const std::vector<float>& R,
+                           std::array<float, 2>& out,
+                           float epsilon = 1e-9f,
+                           int max_iter = 10) {
+    float fx = K[0], fy = K[4], cx = K[2], cy = K[5];
+
+    // Convert to normalized coordinates
+    double x = (p[0] - cx) / fx;
+    double y = (p[1] - cy) / fy;
+    double theta_d = std::sqrt(x * x + y * y);
+
+    if (theta_d < 1e-8) {
+        out[0] = static_cast<float>(x);
+        out[1] = static_cast<float>(y);
+        return;
+    }
+
+    // Distortion coefficients
+    double k1 = D[0], k2 = D[1], k3 = D[2], k4 = D[3];
+
+    // Iteratively solve for theta using Newton-Raphson
+    double theta = theta_d;
+    bool converged = false;
+    for (int i = 0; i < max_iter; ++i) {
+        double t2 = theta * theta;
+        double t4 = t2 * t2;
+        double t6 = t4 * t2;
+        double t8 = t6 * t2;
+
+        // double theta_distorted = theta * (1 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8);
+        double d_theta = (theta * (1 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8) - theta_d) /
+                         (1 + 3 * k1 * t2 + 5 * k2 * t4 + 7 * k3 * t6 + 9 * k4 * t8);
+
+        theta -= d_theta;
+
+        if (std::abs(d_theta) < epsilon) {
+            converged = true;
+            break;
+        }
+    }
+
+    if (!converged) {
+        out[0] = out[1] = -1e6f; // fallback
+        return;
+    }
+
+    double scale = std::tan(theta) / theta_d;
+    double xu = x * scale;
+    double yu = y * scale;
+
+    // Apply rotation
+    double x_r = R[0] * xu + R[1] * yu + R[2];
+    double y_r = R[3] * xu + R[4] * yu + R[5];
+    double z_r = R[6] * xu + R[7] * yu + R[8];
+
+    out[0] = static_cast<float>(x_r / z_r);
+    out[1] = static_cast<float>(y_r / z_r);
+}
+
+void estimateNewCameraMatrixForUndistortRectify(
+    const std::vector<float>& K,         // 3x3 camera matrix
+    const std::vector<float>& D,         // 4x1 distortion coefficients
+    const std::vector<float>& R,         // 3x3 rectification rotation
+    std::vector<float>& Knew,            // 3x3 new intrinsic output
+    float width,
+    float height,
+    float balance = 0.0f,
+    float fov_scale = 1.0f
+) {
+    using Vec2 = std::array<float, 2>;
+
+    std::array<Vec2, 4> corners = {{
+        {width / 2.0f, 0},
+        {width, height / 2.0f},
+        {width / 2.0f, height},
+        {0, height / 2.0f}
+    }};
+
+    std::array<Vec2, 4> undistorted;
+    Vec2 center = {0, 0};
+
+    for (int i = 0; i < 4; ++i) {
+        undistortFisheyePoint(corners[i], K, D, R, undistorted[i]);
+        center[0] += undistorted[i][0];
+        center[1] += undistorted[i][1];
+    }
+
+    center[0] /= 4.0f;
+    center[1] /= 4.0f;
+
+    float aspect = K[0] / K[4];
+
+    // scale y for aspect ratio matching
+    for (auto& pt : undistorted) pt[1] *= aspect;
+    center[1] *= aspect;
+
+    float min_x = std::numeric_limits<float>::max(), max_x = -min_x;
+    float min_y = min_x, max_y = -min_x;
+
+    for (const auto& pt : undistorted) {
+        min_x = std::min(min_x, pt[0]);
+        max_x = std::max(max_x, pt[0]);
+        min_y = std::min(min_y, pt[1]);
+        max_y = std::max(max_y, pt[1]);
+    }
+
+    float f1 = 0.5f * width / (center[0] - min_x);
+    float f2 = 0.5f * width / (max_x - center[0]);
+    float f3 = 0.5f * height * aspect / (center[1] - min_y);
+    float f4 = 0.5f * height * aspect / (max_y - center[1]);
+
+    float fmin = std::min({f1, f2, f3, f4});
+    float fmax = std::max({f1, f2, f3, f4});
+
+    float f = (1.0f - balance) * fmin + balance * fmax;
+    f *= (fov_scale > 0.0f) ? (1.0f / fov_scale) : 1.0f;
+
+    float fx = f;
+    float fy = f / aspect;
+    float cx = -center[0] * f + width * 0.5f;
+    float cy = (-center[1] * f + height * aspect * 0.5f) / aspect;
+
+    Knew.resize(9);
+    Knew[0] = fx;  Knew[1] = 0.0f; Knew[2] = cx;
+    Knew[3] = 0.0f; Knew[4] = fy;  Knew[5] = cy;
+    Knew[6] = 0.0f; Knew[7] = 0.0f; Knew[8] = 1.0f;
+
+    std::cout << "Knew:\n(" << Knew[0] << ", " << Knew[1] << ", " << Knew[2] << ", "
+              << Knew[3] << ", " << Knew[4] << ", " << Knew[5] << ", "
+              << Knew[6] << ", " << Knew[7] << ", " << Knew[8] << ")\n";
+}
 
 void initFisheyeUndistortRectifyMap(
     const std::vector<float>& K, const std::vector<float>& D,
     const std::vector<float>& R, const std::vector<float>& Knew,
     int width, int height,
-    std::vector<uint16_t>& map_x, std::vector<uint16_t>& map_y)
+    std::vector<uint16_t>& map_x, std::vector<uint16_t>& map_y,
+    float balance = 0.0f,
+    float fov_scale = 1.0f)
 {
     map_x.resize(width * height);
     map_y.resize(width * height);
 
-    float fx_new = Knew[0];
-    float fy_new = Knew[4];
+    float fx_new = Knew[0] * fov_scale;
+    float fy_new = Knew[4] * fov_scale;
     float cx_new = Knew[2];
     float cy_new = Knew[5];
 
@@ -469,8 +758,77 @@ void initFisheyeUndistortRectifyMap(
             float xd = x * scale;
             float yd = y * scale;
 
-            map_x[v * width + u] = fx * xd + cx;
-            map_y[v * width + u] = fy * yd + cy;
+            // float mapped_x = fx * xd + cx;
+            // float mapped_y = fy * yd + cy;
+            map_x[v * width + u] = static_cast<uint16_t>(clamp(fx * xd + cx, 0.0f, static_cast<float>(width - 1)));
+            map_y[v * width + u] = static_cast<uint16_t>(clamp(fy * yd + cy, 0.0f, static_cast<float>(height - 1)));
+        }
+    }
+}
+
+void apply_unsharp_mask(uint8_t* data, int w, int h, int stride) {
+  std::vector<uint8_t> tmp(data, data + h * stride);
+  for (int y = 1; y < h - 1; ++y) {
+    for (int x = 1; x < w - 1; ++x) {
+      int idx = y * stride + x;
+      int val = 5 * tmp[idx]
+              - tmp[idx - 1]
+              - tmp[idx + 1]
+              - tmp[idx - stride]
+              - tmp[idx + stride];
+      data[idx] = clamp(val, 0, 255);
+    }
+  }
+}
+
+float cubic_weight(float x) {
+    x = std::fabs(x);
+    if (x <= 1.0f)
+        return (1.5f * x - 2.5f) * x * x + 1.0f;
+    else if (x < 2.0f)
+        return ((-0.5f * x + 2.5f) * x - 4.0f) * x + 2.0f;
+    else
+        return 0.0f;
+}
+
+void resize_and_remap_bicubic(
+    const uint8_t* src, int src_w, int src_h, int src_stride,
+    uint8_t* dst, int dst_w, int dst_h, int dst_stride,
+    const std::vector<uint16_t>& map_x, const std::vector<uint16_t>& map_y,
+    int, int, int channels)
+{
+    if (channels != 1) {
+        printf("Only GRAY8 supported in bicubic.\n");
+        return;
+    }
+
+    for (int y = 0; y < dst_h; ++y) {
+        for (int x = 0; x < dst_w; ++x) {
+            float fx = static_cast<float>(map_x[y * dst_w + x]);
+            float fy = static_cast<float>(map_y[y * dst_w + x]);
+
+            // Clamp within valid region for 4x4 window
+            fx = clamp(fx, 1.0f, static_cast<float>(src_w - 3));
+            fy = clamp(fy, 1.0f, static_cast<float>(src_h - 3));
+
+            int x_int = static_cast<int>(fx);
+            int y_int = static_cast<int>(fy);
+            float dx = fx - x_int;
+            float dy = fy - y_int;
+
+            float result = 0.0f;
+            for (int m = -1; m <= 2; ++m) {
+                float wy = cubic_weight(m - dy);
+                int yy = clamp(y_int + m, 0, src_h - 1);
+                for (int n = -1; n <= 2; ++n) {
+                    float wx = cubic_weight(n - dx);
+                    int xx = clamp(x_int + n, 0, src_w - 1);
+                    result += wx * wy * src[yy * src_stride + xx];
+                }
+            }
+
+            result = clamp(result, 0.0f, 255.0f);
+            dst[y * dst_stride + x] = static_cast<uint8_t>(result + 0.5f);
         }
     }
 }
@@ -479,186 +837,114 @@ void resize_and_remap_bilinear(
   const uint8_t* src, int src_w, int src_h, int src_stride,
   uint8_t* dst, int dst_w, int dst_h, int dst_stride,
   const std::vector<uint16_t>& map_x, const std::vector<uint16_t>& map_y,
-  int resized_w, int resized_h, int channels)
+  int, int, int channels)
 {
-    float scale_x = static_cast<float>(src_w) / static_cast<float>(resized_w);
-    float scale_y = static_cast<float>(src_h) / static_cast<float>(resized_h);
-
-    for (int y = 0; y < dst_h; ++y) {
-        for (int x = 0; x < dst_w; ++x) {
-          uint16_t fx = map_x[y * dst_w + x];
-          uint16_t fy = map_y[y * dst_w + x];
-
-            float sx = fx * scale_x;
-            float sy = fy * scale_y;
-
-            int x0 = static_cast<int>(sx);
-            int y0 = static_cast<int>(sy);
-            float dx = sx - x0;
-            float dy = sy - y0;
-
-            for (int c = 0; c < channels; ++c) {
-                uint8_t value = 0;
-
-                if (x0 >= 0 && x0 + 1 < src_w && y0 >= 0 && y0 + 1 < src_h) {
-                    uint8_t p00 = src[y0 * src_stride + x0 * channels + c];
-                    uint8_t p10 = src[y0 * src_stride + (x0 + 1) * channels + c];
-                    uint8_t p01 = src[(y0 + 1) * src_stride + x0 * channels + c];
-                    uint8_t p11 = src[(y0 + 1) * src_stride + (x0 + 1) * channels + c];
-
-                    float val = (1 - dx) * (1 - dy) * p00 +
-                                dx * (1 - dy) * p10 +
-                                (1 - dx) * dy * p01 +
-                                dx * dy * p11;
-
-                    value = static_cast<uint8_t>(val + 0.5f);
-                }
-                int rr = y * dst_stride + x * channels + c;
-
-                dst[rr] = value;
-            }
-        }
-    }
-}
-
-#if defined(__aarch64__)
-
-void resize_and_remap_bilinear_neon(
-  const uint8_t* __restrict src, int src_w, int src_h, int src_stride,
-  uint8_t* __restrict dst, int dst_w, int dst_h, int dst_stride,
-  const std::vector<uint16_t>& map_x, const std::vector<uint16_t>& map_y,
-  int resized_w, int resized_h, int channels)
-{
-    const float scale_x = static_cast<float>(src_w) / resized_w;
-    const float scale_y = static_cast<float>(src_h) / resized_h;
-
-    if (channels != 1) {
-        printf("Only GRAY8 supported.\\n");
-        return;
-    }
-
-    for (int y = 0; y < dst_h; ++y) {
-        int map_row_offset = y * dst_w;
-        int dst_row_offset = y * dst_stride;
-
-        for (int x = 0; x < dst_w; x += 8) {
-            // Load 8 raw pixel coordinates from uint16_t maps
-            uint16x8_t mapx_u16 = vld1q_u16(&map_x[map_row_offset + x]);
-            uint16x8_t mapy_u16 = vld1q_u16(&map_y[map_row_offset + x]);
-
-            float32x4_t fx_low = vcvtq_f32_u32(vmovl_u16(vget_low_u16(mapx_u16)));
-            float32x4_t fx_high = vcvtq_f32_u32(vmovl_u16(vget_high_u16(mapx_u16)));
-            float32x4_t fy_low = vcvtq_f32_u32(vmovl_u16(vget_low_u16(mapy_u16)));
-            float32x4_t fy_high = vcvtq_f32_u32(vmovl_u16(vget_high_u16(mapy_u16)));
-
-            // Apply scaling (optional, depending on remap math)
-            fx_low = vmulq_n_f32(fx_low, scale_x);
-            fx_high = vmulq_n_f32(fx_high, scale_x);
-            fy_low = vmulq_n_f32(fy_low, scale_y);
-            fy_high = vmulq_n_f32(fy_high, scale_y);
-
-            int32x4_t x0_low = vcvtq_s32_f32(fx_low);
-            int32x4_t x0_high = vcvtq_s32_f32(fx_high);
-            int32x4_t y0_low = vcvtq_s32_f32(fy_low);
-            int32x4_t y0_high = vcvtq_s32_f32(fy_high);
-
-            float32x4_t dx_low = vsubq_f32(fx_low, vcvtq_f32_s32(x0_low));
-            float32x4_t dx_high = vsubq_f32(fx_high, vcvtq_f32_s32(x0_high));
-            float32x4_t dy_low = vsubq_f32(fy_low, vcvtq_f32_s32(y0_low));
-            float32x4_t dy_high = vsubq_f32(fy_high, vcvtq_f32_s32(y0_high));
-
-            for (int i = 0; i < 4; ++i) {
-                int xi = x + i;
-                int x0 = vgetq_lane_s32(x0_low, i);
-                int y0 = vgetq_lane_s32(y0_low, i);
-                float dx = vgetq_lane_f32(dx_low, i);
-                float dy = vgetq_lane_f32(dy_low, i);
-
-                uint8_t value = 0;
-                if (x0 >= 0 && x0 + 1 < src_w && y0 >= 0 && y0 + 1 < src_h) {
-                    uint8_t p00 = src[y0 * src_stride + x0];
-                    uint8_t p10 = src[y0 * src_stride + x0 + 1];
-                    uint8_t p01 = src[(y0 + 1) * src_stride + x0];
-                    uint8_t p11 = src[(y0 + 1) * src_stride + x0 + 1];
-
-                    float val = (1 - dx) * (1 - dy) * p00 +
-                                dx * (1 - dy) * p10 +
-                                (1 - dx) * dy * p01 +
-                                dx * dy * p11;
-
-                    value = static_cast<uint8_t>(val + 0.5f);
-                }
-                dst[dst_row_offset + xi] = value;
-            }
-
-            for (int i = 0; i < 4; ++i) {
-                int xi = x + 4 + i;
-                int x0 = vgetq_lane_s32(x0_high, i);
-                int y0 = vgetq_lane_s32(y0_high, i);
-                float dx = vgetq_lane_f32(dx_high, i);
-                float dy = vgetq_lane_f32(dy_high, i);
-
-                uint8_t value = 0;
-                if (x0 >= 0 && x0 + 1 < src_w && y0 >= 0 && y0 + 1 < src_h) {
-                    uint8_t p00 = src[y0 * src_stride + x0];
-                    uint8_t p10 = src[y0 * src_stride + x0 + 1];
-                    uint8_t p01 = src[(y0 + 1) * src_stride + x0];
-                    uint8_t p11 = src[(y0 + 1) * src_stride + x0 + 1];
-
-                    float val = (1 - dx) * (1 - dy) * p00 +
-                                dx * (1 - dy) * p10 +
-                                (1 - dx) * dy * p01 +
-                                dx * dy * p11;
-
-                    value = static_cast<uint8_t>(val + 0.5f);
-                }
-                dst[dst_row_offset + xi] = value;
-            }
-        }
-    }
-}
-#endif
-
-
-void resize_and_remap_nearest(
-  const uint8_t* src, int src_w, int src_h, int src_stride,
-  uint8_t* dst, int dst_w, int dst_h, int dst_stride,
-  const std::vector<uint16_t>& map_x, const std::vector<uint16_t>& map_y,
-  int resized_w, int resized_h, int channels)
-{
-  // dst.resize(dst_h * dst_stride);  // Ensure output buffer is big enough
-
-  float scale_x = static_cast<float>(src_w) / static_cast<float>(resized_w);
-  float scale_y = static_cast<float>(src_h) / static_cast<float>(resized_h);
-
   for (int y = 0; y < dst_h; ++y) {
-      for (int x = 0; x < dst_w; ++x) {
-          uint16_t fx = map_x[y * dst_w + x];
-          uint16_t fy = map_y[y * dst_w + x];
+    for (int x = 0; x < dst_w; ++x) {
+      int idx = y * dst_w + x;
 
-          // Apply scale to map from normalized rectified to source image
-          int sx = static_cast<int>(fx * scale_x + 0.5f);
-          int sy = static_cast<int>(fy * scale_y + 0.5f);
+      float sx = static_cast<float>(map_x[idx]);
+      float sy = static_cast<float>(map_y[idx]);
 
-          for (int c = 0; c < channels; ++c) {
-              uint8_t value = 0;
+      sx = clamp(sx, 0.0f, (float)(src_w - 2));
+      sy = clamp(sy, 0.0f, (float)(src_h - 2));
 
-              if (sx >= 0 && sx < src_w && sy >= 0 && sy < src_h) {
-                  value = src[sy * src_stride + sx * channels + c];
-              }
+      int x0 = static_cast<int>(sx);
+      int y0 = static_cast<int>(sy);
+      float dx = sx - x0;
+      float dy = sy - y0;
 
-              dst[y * dst_stride + x * channels + c] = value;
-          }
+      for (int c = 0; c < channels; ++c) {
+        uint8_t p00 = src[y0 * src_stride + x0 * channels + c];
+        uint8_t p10 = src[y0 * src_stride + (x0 + 1) * channels + c];
+        uint8_t p01 = src[(y0 + 1) * src_stride + x0 * channels + c];
+        uint8_t p11 = src[(y0 + 1) * src_stride + (x0 + 1) * channels + c];
+
+        float val = (1 - dx) * (1 - dy) * p00 +
+                    dx * (1 - dy) * p10 +
+                    (1 - dx) * dy * p01 +
+                    dx * dy * p11;
+
+        dst[y * dst_stride + x * channels + c] = static_cast<uint8_t>(std::round(val));
       }
+    }
   }
 }
 
 #if defined(__aarch64__)
+#include <arm_neon.h>
+#include <cmath>
+#include <algorithm>
+
+static inline uint8_t sharpen(uint8_t center, uint8_t left, uint8_t right, uint8_t top, uint8_t bottom) {
+    int result = 5 * center - left - right - top - bottom;
+    return static_cast<uint8_t>(clamp(result, 0, 255));
+}
+
+// Existing bilinear function remains here...
+
+// void resize_and_remap_nearest_neon(
+//   const uint8_t* __restrict src, uint src_w, uint src_h, int src_stride,
+//   uint8_t* __restrict dst, int dst_w, int dst_h, int dst_stride,
+//   const std::vector<uint16_t>& map_x, const std::vector<uint16_t>& map_y,
+//   int /*resized_w*/, int /*resized_h*/, int channels)
+// {
+//     if (channels != 1) {
+//         printf("Only GRAY8 supported in NEON version.\n");
+//         return;
+//     }
+
+//     for (int y = 0; y < dst_h; ++y) {
+//         int map_row_offset = y * dst_w;
+//         int dst_row_offset = y * dst_stride;
+
+//         for (int x = 0; x < dst_w; x += 8) {
+//             uint16x8_t fx_fixed = vld1q_u16(&map_x[map_row_offset + x]);
+//             uint16x8_t fy_fixed = vld1q_u16(&map_y[map_row_offset + x]);
+
+//             uint32x4_t sx_low = (vmovl_u16(vget_low_u16(fx_fixed)));
+//             uint32x4_t sx_high = (vmovl_u16(vget_high_u16(fx_fixed)));
+//             uint32x4_t sy_low = (vmovl_u16(vget_low_u16(fy_fixed)));
+//             uint32x4_t sy_high = (vmovl_u16(vget_high_u16(fy_fixed)));
+
+//             for (int i = 0; i < 4; ++i) {
+//                 int xi = x + i;
+//                 int sx = std::min<int>(std::max<int>(static_cast<int>(vgetq_lane_u32(sx_low, i)), 0), src_w - 1);
+//                 int sy = std::min<int>(std::max<int>(static_cast<int>(vgetq_lane_u32(sy_low, i)), 0), src_h - 1);
+//                 uint8_t center = src[sy * src_stride + sx];
+//                 uint8_t left   = sx > 0 ? src[sy * src_stride + sx - 1] : center;
+//                 uint8_t right  = sx < src_w - 1 ? src[sy * src_stride + sx + 1] : center;
+//                 uint8_t top    = sy > 0 ? src[(sy - 1) * src_stride + sx] : center;
+//                 uint8_t bottom = sy < src_h - 1 ? src[(sy + 1) * src_stride + sx] : center;
+//                 dst[dst_row_offset + xi] = sharpen(center, left, right, top, bottom);
+//             }
+//             for (int i = 0; i < 4; ++i) {
+//                 int xi = x + 4 + i;
+//                 int sx = std::min(std::max(vgetq_lane_u32(sx_high, i), 0), src_w - 1);
+//                 int sy = std::min(std::max(vgetq_lane_u32(sy_high, i), 0), src_h - 1);
+//                 uint8_t center = src[sy * src_stride + sx];
+//                 uint8_t left   = sx > 0 ? src[sy * src_stride + sx - 1] : center;
+//                 uint8_t right  = sx < src_w - 1 ? src[sy * src_stride + sx + 1] : center;
+//                 uint8_t top    = sy > 0 ? src[(sy - 1) * src_stride + sx] : center;
+//                 uint8_t bottom = sy < src_h - 1 ? src[(sy + 1) * src_stride + sx] : center;
+//                 dst[dst_row_offset + xi] = sharpen(center, left, right, top, bottom);
+//             }
+//         }
+//     }
+// }
+
+// resize_and_remap_nearest_neon.cpp
+#include <arm_neon.h>
+#include <vector>
+#include <stdint.h>
+#include <algorithm>
+
+// Fixed-point nearest-neighbor remap with NEON for GRAY8 (CV_8UC1)
 void resize_and_remap_nearest_neon(
-  const uint8_t* __restrict src, int src_w, int src_h, int src_stride,
-  uint8_t* __restrict dst, int dst_w, int dst_h, int dst_stride,
-  const std::vector<uint16_t>& map_x, const std::vector<uint16_t>& map_y,
-  int /*resized_w*/, int /*resized_h*/, int channels)
+    const uint8_t* __restrict src, int src_w, int src_h, int src_stride,
+    uint8_t* __restrict dst, int dst_w, int dst_h, int dst_stride,
+    const std::vector<uint16_t>& map_x, const std::vector<uint16_t>& map_y,
+    int /*resized_w*/, int /*resized_h*/, int channels)
 {
     if (channels != 1) {
         printf("Only GRAY8 supported in NEON version.\n");
@@ -670,53 +956,219 @@ void resize_and_remap_nearest_neon(
         int dst_row_offset = y * dst_stride;
 
         for (int x = 0; x < dst_w; x += 8) {
-            // Load 8 fixed-point values (assume already in pixel coords)
-            uint16x8_t fx_fixed = vld1q_u16(&map_x[map_row_offset + x]);
-            uint16x8_t fy_fixed = vld1q_u16(&map_y[map_row_offset + x]);
+            // Load 8 x-coordinates and 8 y-coordinates
+            uint16x8_t mapx_u16 = vld1q_u16(&map_x[map_row_offset + x]);
+            uint16x8_t mapy_u16 = vld1q_u16(&map_y[map_row_offset + x]);
 
-            // Convert to int32 (assume integer values, no scaling)
-            int32x4_t sx_low = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(fx_fixed)));
-            int32x4_t sx_high = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(fx_fixed)));
-            int32x4_t sy_low = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(fy_fixed)));
-            int32x4_t sy_high = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(fy_fixed)));
+            // Convert to 32-bit for indexing
+            uint32x4_t sx_lo_u32 = vmovl_u16(vget_low_u16(mapx_u16));
+            uint32x4_t sx_hi_u32 = vmovl_u16(vget_high_u16(mapx_u16));
+            uint32x4_t sy_lo_u32 = vmovl_u16(vget_low_u16(mapy_u16));
+            uint32x4_t sy_hi_u32 = vmovl_u16(vget_high_u16(mapy_u16));
 
-            // Per-pixel fetch (no gather support in NEON)
             for (int i = 0; i < 4; ++i) {
                 int xi = x + i;
-                int sx = vgetq_lane_s32(sx_low, i);
-                int sy = vgetq_lane_s32(sy_low, i);
-
-                // Clamp to avoid black frames
-                sx = std::min(std::max(sx, 0), src_w - 1);
-                sy = std::min(std::max(sy, 0), src_h - 1);
-
+                int sx = std::min((int)vgetq_lane_u32(sx_lo_u32, i), src_w - 1);
+                int sy = std::min((int)vgetq_lane_u32(sy_lo_u32, i), src_h - 1);
                 dst[dst_row_offset + xi] = src[sy * src_stride + sx];
+            }
+            for (int i = 0; i < 4; ++i) {
+                int xi = x + 4 + i;
+                int sx = std::min((int)vgetq_lane_u32(sx_hi_u32, i), src_w - 1);
+                int sy = std::min((int)vgetq_lane_u32(sy_hi_u32, i), src_h - 1);
+                dst[dst_row_offset + xi] = src[sy * src_stride + sx];
+            }
+        }
+    }
+}
+
+
+inline float32x4_t cubic_weight_neon(float32x4_t x) {
+    float32x4_t abs_x = vabsq_f32(x);
+    uint32x4_t mask1 = vcleq_f32(abs_x, vdupq_n_f32(1.0f));
+    uint32x4_t mask2 = vandq_u32(vcgtq_f32(abs_x, vdupq_n_f32(1.0f)), vcltq_f32(abs_x, vdupq_n_f32(2.0f)));
+
+    float32x4_t x2 = vmulq_f32(abs_x, abs_x);
+    float32x4_t x3 = vmulq_f32(x2, abs_x);
+
+    float32x4_t w1 = vmlaq_f32(vdupq_n_f32(-2.5f), abs_x, vdupq_n_f32(1.5f));
+    w1 = vmlaq_f32(vdupq_n_f32(1.0f), x2, w1);
+
+    float32x4_t w2 = vmlaq_f32(vdupq_n_f32(2.5f), abs_x, vdupq_n_f32(-0.5f));
+    w2 = vmlaq_f32(vdupq_n_f32(-4.0f), x2, w2);
+    w2 = vmlaq_f32(vdupq_n_f32(2.0f), x3, w2);
+
+    return vbslq_f32(mask1, w1, vbslq_f32(mask2, w2, vdupq_n_f32(0.0f)));
+}
+
+void resize_and_remap_bicubic_neon(
+    const uint8_t* __restrict src, int src_w, int src_h, int src_stride,
+    uint8_t* __restrict dst, int dst_w, int dst_h, int dst_stride,
+    const std::vector<uint16_t>& map_x, const std::vector<uint16_t>& map_y,
+    int, int, int channels)
+{
+    if (channels != 1) {
+        printf("Only GRAY8 supported in bicubic NEON.\n");
+        return;
+    }
+
+    for (int y = 0; y < dst_h; ++y) {
+        for (int x = 0; x < dst_w; x += 4) {
+            float fx[4], fy[4];
+            int x_int[4], y_int[4];
+            float dx[4], dy[4];
+
+            for (int i = 0; i < 4; ++i) {
+                int idx = y * dst_w + (x + i);
+                fx[i] = clamp((float)map_x[idx], 1.0f, (float)(src_w - 3));
+                fy[i] = clamp((float)map_y[idx], 1.0f, (float)(src_h - 3));
+                x_int[i] = (int)fx[i];
+                y_int[i] = (int)fy[i];
+                dx[i] = fx[i] - x_int[i];
+                dy[i] = fy[i] - y_int[i];
+            }
+
+            float32x4_t dx_v = vld1q_f32(dx);
+            float32x4_t dy_v = vld1q_f32(dy);
+
+            float result[4] = {0};
+
+            for (int m = -1; m <= 2; ++m) {
+                float32x4_t dy_off = vsubq_f32(vdupq_n_f32((float)m), dy_v);
+                float32x4_t wy = cubic_weight_neon(dy_off);
+
+                for (int n = -1; n <= 2; ++n) {
+                    float32x4_t dx_off = vsubq_f32(vdupq_n_f32((float)n), dx_v);
+                    float32x4_t wx = cubic_weight_neon(dx_off);
+                    float32x4_t weight = vmulq_f32(wy, wx);
+
+                    for (int i = 0; i < 4; ++i) {
+                        int sx = clamp(x_int[i] + n, 0, src_w - 1);
+                        int sy = clamp(y_int[i] + m, 0, src_h - 1);
+                        uint8_t p = src[sy * src_stride + sx];
+                        result[i] += vgetq_lane_f32(weight, i) * p;
+                    }
+                }
             }
 
             for (int i = 0; i < 4; ++i) {
-                int xi = x + 4 + i;
-                int sx = vgetq_lane_s32(sx_high, i);
-                int sy = vgetq_lane_s32(sy_high, i);
-
-                sx = std::min(std::max(sx, 0), src_w - 1);
-                sy = std::min(std::max(sy, 0), src_h - 1);
-
-                dst[dst_row_offset + xi] = src[sy * src_stride + sx];
+                result[i] = clamp(result[i], 0.0f, 255.0f);
+                int cx = clamp(x_int[i], 0, src_w - 1);
+                int cy = clamp(y_int[i], 0, src_h - 1);
+                uint8_t center = static_cast<uint8_t>(result[i] + 0.5f);
+                uint8_t left   = cx > 0 ? src[cy * src_stride + cx - 1] : center;
+                uint8_t right  = cx < src_w - 1 ? src[cy * src_stride + cx + 1] : center;
+                uint8_t top    = cy > 0 ? src[(cy - 1) * src_stride + cx] : center;
+                uint8_t bottom = cy < src_h - 1 ? src[(cy + 1) * src_stride + cx] : center;
+                dst[y * dst_stride + x + i] = sharpen(center, left, right, top, bottom);
             }
         }
     }
 }
 #endif
 
+void resize_and_remap_nearest(
+  const uint8_t* src, int src_w, int src_h, int src_stride,
+  uint8_t* dst, int dst_w, int dst_h, int dst_stride,
+  const std::vector<uint16_t>& map_x, const std::vector<uint16_t>& map_y,
+  int, int, int channels)
+{
+  for (int y = 0; y < dst_h; ++y) {
+    for (int x = 0; x < dst_w; ++x) {
+      int idx = y * dst_w + x;
+
+      int sx = std::min(std::max((int)map_x[idx], 0), src_w - 1);
+      int sy = std::min(std::max((int)map_y[idx], 0), src_h - 1);
+
+      for (int c = 0; c < channels; ++c) {
+        dst[y * dst_stride + x * channels + c] =
+            src[sy * src_stride + sx * channels + c];
+      }
+    }
+  }
+}
+
+#if defined(__aarch64__)
+
+
+void resize_and_remap_bilinear_neon(
+  const uint8_t* __restrict src, int src_w, int src_h, int src_stride,
+  uint8_t* __restrict dst, int dst_w, int dst_h, int dst_stride,
+  const std::vector<uint16_t>& map_x, const std::vector<uint16_t>& map_y,
+  int resized_w, int resized_h, int channels)
+{
+    const float scale_x = static_cast<float>(src_w) / resized_w;
+    const float scale_y = static_cast<float>(src_h) / resized_h;
+
+    if (channels != 1) {
+        printf("Only GRAY8 supported.\n");
+        return;
+    }
+
+    for (int y = 0; y < dst_h; ++y) {
+        int map_row_offset = y * dst_w;
+        int dst_row_offset = y * dst_stride;
+
+        for (int x = 0; x < dst_w; x += 8) {
+            uint16x8_t mapx_u16 = vld1q_u16(&map_x[map_row_offset + x]);
+            uint16x8_t mapy_u16 = vld1q_u16(&map_y[map_row_offset + x]);
+
+            float fx_array[8], fy_array[8];
+            int x0_array[8], y0_array[8];
+            float dx_array[8], dy_array[8];
+
+            for (int i = 0; i < 8; ++i) {
+                fx_array[i] = static_cast<float>(map_x[map_row_offset + x + i]) * scale_x;
+                fy_array[i] = static_cast<float>(map_y[map_row_offset + x + i]) * scale_y;
+                x0_array[i] = static_cast<int>(fx_array[i]);
+                y0_array[i] = static_cast<int>(fy_array[i]);
+                dx_array[i] = fx_array[i] - x0_array[i];
+                dy_array[i] = fy_array[i] - y0_array[i];
+            }
+
+            for (int i = 0; i < 8; ++i) {
+                int xi = x + i;
+                int x0i = x0_array[i];
+                int y0i = y0_array[i];
+                float dxi = dx_array[i];
+                float dyi = dy_array[i];
+
+                uint8_t value = 0;
+                if (x0i >= 1 && x0i + 1 < src_w - 1 && y0i >= 1 && y0i + 1 < src_h - 1) {
+                    uint8_t p00 = src[y0i * src_stride + x0i];
+                    uint8_t p10 = src[y0i * src_stride + x0i + 1];
+                    uint8_t p01 = src[(y0i + 1) * src_stride + x0i];
+                    uint8_t p11 = src[(y0i + 1) * src_stride + x0i + 1];
+
+                    float val = (1 - dxi) * (1 - dyi) * p00 +
+                                dxi * (1 - dyi) * p10 +
+                                (1 - dxi) * dyi * p01 +
+                                dxi * dyi * p11;
+
+                    uint8_t interp = static_cast<uint8_t>(val + 0.5f);
+
+                    uint8_t left = src[y0i * src_stride + x0i - 1];
+                    uint8_t right = src[y0i * src_stride + x0i + 1];
+                    uint8_t top = src[(y0i - 1) * src_stride + x0i];
+                    uint8_t bottom = src[(y0i + 1) * src_stride + x0i];
+
+                    value = sharpen(interp, left, right, top, bottom);
+                }
+                dst[dst_row_offset + xi] = value;
+            }
+        }
+    }
+}
+#endif
+
+
 // // /* transform */
 static GstFlowReturn
-gst_undistort_transform_frame (GstVideoFilter * filter, GstVideoFrame * inframe, GstVideoFrame * outframe)
+gst_undistort_transform_frame(GstVideoFilter * filter, GstVideoFrame * inframe, GstVideoFrame * outframe)
 {
   GstUndistort *undistortClass = GST_UNDISTORT (filter);
 
   GST_DEBUG_OBJECT (undistortClass, "transform_frame");
-
-  static int i=0;
 
   GstMapInfo map_info;
   GstMapInfo info;
@@ -724,22 +1176,21 @@ gst_undistort_transform_frame (GstVideoFilter * filter, GstVideoFrame * inframe,
   gst_buffer_map ((inframe->buffer), &map_info, GST_MAP_READ);
   gst_buffer_map((outframe->buffer), &info, GST_MAP_WRITE);
 
-  if (i ==0)
+  undistortClass->width = GST_VIDEO_FRAME_WIDTH(inframe);
+  undistortClass->height = GST_VIDEO_FRAME_HEIGHT(inframe);
+  undistortClass->channels = 1;
+  undistortClass->stride =  undistortClass->width *  undistortClass->channels;
+  if (undistortClass->initialized == FALSE)
   {
-    undistortClass->width = GST_VIDEO_FRAME_WIDTH(inframe);
-    undistortClass->height = GST_VIDEO_FRAME_HEIGHT(inframe);
-    undistortClass->channels = 1;
-    undistortClass->stride =  undistortClass->width *  undistortClass->channels;
-
-    
     undistortClass->K = {undistortClass->fx, 0.0, undistortClass->cx, 0.0, undistortClass->fy, undistortClass->cy, 0.0, 0.0, 1.0};
-    undistortClass->D = {undistortClass->d0, undistortClass->d1, 0.0, 0.0}; // 4 distortion coeffs
+    undistortClass->D = {undistortClass->d0, undistortClass->d1, undistortClass->p1, undistortClass->p2}; // 4 distortion coeffs
 
-    estimateNewCameraMatrix(undistortClass->K, undistortClass->Knew, undistortClass->width, undistortClass->height, 0.0f, 1.0f);
+    estimateNewCameraMatrixForUndistortRectify(undistortClass->K, undistortClass->D, undistortClass->R, undistortClass->Knew, undistortClass->width, undistortClass->height, undistortClass->balance, undistortClass->fov);
     initFisheyeUndistortRectifyMap(undistortClass->K, undistortClass->D, undistortClass->R, undistortClass->Knew, undistortClass->width, undistortClass->height, undistortClass->map_x, undistortClass->map_y);
-    std::cout << "INIT_MAPS on the fly" << std::endl;
+    std::cout << "LOOP: INIT_MAPS on the fly with balance: " << undistortClass->balance << " FOV: " << undistortClass->fov << std::endl;
+    undistortClass->initialized = TRUE;
   }
-  if (i > 0)
+  else
   {
     if (undistortClass->interpolation == INTERPOLATION_K_NEAREST)
     #if defined(__aarch64__)
@@ -769,14 +1220,77 @@ gst_undistort_transform_frame (GstVideoFilter * filter, GstVideoFrame * inframe,
       undistortClass->map_x, undistortClass->map_y,
       undistortClass->width, undistortClass->height, undistortClass->channels);
     #endif
+    else if (undistortClass->interpolation == INTERPOLATION_BICUBIC)
+    #if defined(__aarch64__)
+    resize_and_remap_bicubic_neon(
+      map_info.data, undistortClass->width, undistortClass->height, undistortClass->stride,
+      info.data, undistortClass->width, undistortClass->height, undistortClass->stride,
+      undistortClass->map_x, undistortClass->map_y,
+      undistortClass->width, undistortClass->height, undistortClass->channels);
+    #else
+    resize_and_remap_bicubic(
+      map_info.data, undistortClass->width, undistortClass->height, undistortClass->stride,
+      info.data, undistortClass->width, undistortClass->height, undistortClass->stride,
+      undistortClass->map_x, undistortClass->map_y,
+      undistortClass->width, undistortClass->height, undistortClass->channels);
+    #endif
+    else if (undistortClass->interpolation == INTERPOLATION_OPENCV)
+    {
+    #if defined(USE_CV)
+      cv::Mat input(undistortClass->height, undistortClass->width, CV_8UC1, map_info.data, undistortClass->stride);
+      cv::Mat output(undistortClass->height, undistortClass->width, CV_8UC1, info.data, undistortClass->stride);
+      cv::remap(input, output, undistortClass->map1CV, undistortClass->map2CV, cv::INTER_NEAREST);
+    #else
+    std::cout << "Opencv not defined " << std::endl;
+    #endif
+    }
   }
-
-  i = i+1;
-  
+  // apply_unsharp_mask(info.data, undistortClass->width, undistortClass->height, undistortClass->stride);  
   gst_buffer_unmap ((inframe->buffer), &map_info);
   gst_buffer_unmap ((outframe->buffer), &info);
 
   return GST_FLOW_OK;
+}
+
+
+
+static gboolean
+gst_undistort_set_info (GstVideoFilter * filter, GstCaps * incaps,
+    GstVideoInfo * in_info, GstCaps * outcaps, GstVideoInfo * out_info)
+{
+  GstUndistort *undistort = GST_UNDISTORT (filter);
+  GST_DEBUG_OBJECT (undistort, "set_info");
+
+  undistort->width = GST_VIDEO_INFO_WIDTH(in_info);
+  undistort->height = GST_VIDEO_INFO_HEIGHT(in_info);
+  undistort->channels = 1;
+  undistort->stride = undistort->width * undistort->channels;
+
+  undistort->K = { undistort->fx, 0.0f, undistort->cx,
+                   0.0f, undistort->fy, undistort->cy,
+                   0.0f, 0.0f, 1.0f };
+
+  undistort->D = { undistort->d0, undistort->d1, undistort->p1, undistort->p2 };
+
+
+
+  #if defined(USE_CV)
+    compute_undistort_maps_from_opencv(undistort, undistort->K, undistort->D, undistort->R, undistort->Knew, undistort->width , undistort->height, undistort->balance, undistort->fov, undistort->map_x, undistort->map_y);
+  #else
+  estimateNewCameraMatrixForUndistortRectify(
+      undistort->K, undistort->D, undistort->R,
+      undistort->Knew, undistort->width, undistort->height,
+      undistort->balance, undistort->fov);
+
+  initFisheyeUndistortRectifyMap(
+      undistort->K, undistort->D, undistort->R, undistort->Knew,
+      undistort->width, undistort->height,
+      undistort->map_x, undistort->map_y);
+  #endif
+  undistort->initialized = TRUE;
+  std::cout << "Map initialized in set_info()\n";
+
+  return TRUE;
 }
 
 static GstFlowReturn

@@ -17,6 +17,30 @@
  * Boston, MA 02110-1301, USA.
  */
 
+ /**
+  * EXAMPLE: ARM
+  *            appsrc name=tracking_cam_to_rtp_appsrc !
+              video/x-raw,framerate=40/1,width=640,height=480,format=GRAY8 !
+              undistort fx=279.98435515  cx=290.6865358454301 fy=277.5687125242331 cy=240.1597738541476 d0=-0.006319990900085937 d1=0.00155893534296691 algo=0 fov=1.0 balance=0.5 !
+              videoconvert !
+              video/x-raw,format=NV12 !
+              omxh264enc name=encoder interval-intraframes=60 target-bitrate=1500000 !
+              video/x-h264,profile=main !
+              h264parse !
+              queue max-size-buffers=1 leaky=downstream !
+              rtph264pay config-interval=1 name=pay0 pt=96 mtu=1200
+  EXAMPLE: AMD
+              gst-launch-1.0 --gst-plugin-path=/home/amither/Downloads/calibartion/build_amd/ rtspsrc location=rtsp://192.0.systemID.droneID:port/mount  !
+              rtph264depay !
+              h264parse !
+              avdec_h264 !
+              videoconvert !
+              undistort fx=277.7090664510777 cx=290.6865358454301 fy=277.5687125242331 cy=240.1597738541476 d0=-0.006319990900085937 d1=0.00155893534296691 algo=0 fov=1.0 balance=0.0 !
+              videoconvert !
+              autovideosink sync=false
+
+  */
+
 #ifndef _GST_UNDISTORT_H_
 #define _GST_UNDISTORT_H_
 
@@ -24,6 +48,15 @@
 #include <gst/video/gstvideofilter.h>
 #include <iostream>
 #include <vector>
+
+#define USE_CV 1
+
+#if defined(USE_CV)
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/core/types.hpp>
+#endif
 
 G_BEGIN_DECLS
 
@@ -40,15 +73,15 @@ typedef struct _GstUndistortClass GstUndistortClass;
 typedef enum Interpolation_t
 {
   INTERPOLATION_K_NEAREST = 0,
-  INTERPOLATION_BILINEAR  = 1
+  INTERPOLATION_BILINEAR  = 1,
+  INTERPOLATION_BICUBIC   = 2,
+  INTERPOLATION_OPENCV    = 3,
 }Interpolation;
 
 struct _GstUndistort
 {
   GstVideoFilter base_undistort;
 
-  double balance = 0.0; // 0 = crop more, 1 = crop less
-  double fov_scale = 1.0; // default
   gboolean crop = FALSE;
   gboolean initialized = FALSE;
 
@@ -63,6 +96,11 @@ struct _GstUndistort
   float cy;
   float d0;
   float d1;
+  float p1;
+  float p2;
+
+  float fov = 1.0f;
+  float balance = 1.0f;
 
   std::vector<float> K;
   std::vector<float> D;
@@ -78,7 +116,10 @@ struct _GstUndistort
   int stride;
   int channels;
   Interpolation interpolation;
-
+  
+  #if defined(USE_CV)
+  cv::Mat map1CV, map2CV;
+  #endif
 };
 
 struct _GstUndistortClass
